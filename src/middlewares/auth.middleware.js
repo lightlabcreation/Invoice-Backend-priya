@@ -1,0 +1,401 @@
+import { verifyToken } from '../utils/token.js';
+import prisma from '../config/db.js';
+import { getEffectivePermissions, hasPermission } from '../utils/permissions.js';
+
+/**
+ * Require authentication middleware.
+ * Reads token from HTTP-only cookie or Authorization: Bearer <token> header.
+ */
+export async function requireAuth(req, res, next) {
+  let token = null;
+
+  // 1. Try reading from cookie
+  if (req.cookies && req.cookies.token) {
+    token = req.cookies.token;
+  }
+  // 2. Fallback to Authorization Bearer header
+  else if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+    token = req.headers.authorization.split(' ')[1];
+  }
+
+  if (!token) {
+    return res.status(401).json({
+      status: 'error',
+      code: 'UNAUTHORIZED',
+      message: 'Authentication required. Please log in.',
+    });
+  }
+
+  const decoded = verifyToken(token);
+  if (!decoded || !decoded.userId) {
+    return res.status(401).json({
+      status: 'error',
+      code: 'INVALID_TOKEN',
+      message: 'Session invalid or expired. Please log in again.',
+    });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      include: {
+        customer: {
+          select: {
+            id: true,
+            name: true,
+            contactPerson: true,
+            email: true,
+            vanId: true,
+            status: true,
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      return res.status(401).json({
+        status: 'error',
+        code: 'USER_NOT_FOUND',
+        message: 'The user account associated with this session no longer exists.',
+      });
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'ACCOUNT_DEACTIVATED',
+        message: 'This account has been deactivated. Please contact an administrator.',
+      });
+    }
+
+    const effectivePermissions = getEffectivePermissions(user);
+
+    // Attach sanitized user to request (omit passwordHash)
+    req.user = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      title: user.title,
+      permissions: user.permissions || null,
+      effectivePermissions,
+      customerId: user.customerId,
+      customer: user.customer,
+      lastLoginAt: user.lastLoginAt,
+    };
+
+    next();
+  } catch (error) {
+    console.error('Auth middleware error:', error);
+    return res.status(500).json({
+      status: 'error',
+      code: 'INTERNAL_ERROR',
+      message: 'An error occurred while validating your session.',
+    });
+  }
+}
+
+/**
+ * Enforce server-side Role-Based Access Control (RBAC).
+ * @param {string[]} allowedRoles Array of allowed role names (e.g. ['admin', 'accountant'])
+ */
+export function requireRole(allowedRoles = []) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({
+        status: 'error',
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required.',
+      });
+    }
+
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'FORBIDDEN',
+        message: `Forbidden: Access restricted to roles [${allowedRoles.join(', ')}]. Your active role is '${req.user.role}'.`,
+      });
+    }
+
+    next();
+  };
+}
+
+/**
+ * Enforce server-side Granular Permission verification.
+ * @param {string} permission Required permission string (e.g. 'invoices:create')
+ */
+export function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({
+        status: 'error',
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required.',
+      });
+    }
+
+    if (!hasPermission(req.user, permission)) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'FORBIDDEN',
+        message: `Forbidden: Missing required permission '${permission}'.`,
+      });
+    }
+
+    next();
+  };
+}
+
+/**
+ * Enforce that the user has at least one of the specified permissions.
+ * @param {string[]} permissions Array of acceptable permissions
+ */
+export function requireAnyPermission(permissions = []) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({
+        status: 'error',
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required.',
+      });
+    }
+
+    const hasAny = permissions.some((perm) => hasPermission(req.user, perm));
+    if (!hasAny) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'FORBIDDEN',
+        message: `Forbidden: Requires at least one of [${permissions.join(', ')}].`,
+      });
+    }
+
+    next();
+  };
+}
+
+/**
+ * Enforce customer account isolation.
+ * Prevents a customer from passing another customerId in params, query, or body.
+ */
+export function enforceCustomerScope(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ status: 'error', message: 'Authentication required.' });
+  }
+
+  // Admins and accountants have organization-wide visibility
+  if (req.user.role === 'admin' || req.user.role === 'accountant') {
+    return next();
+  }
+
+  // Customer role must have customerId and cannot query other customer accounts
+  if (req.user.role === 'customer') {
+    if (!req.user.customerId) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'NO_CUSTOMER_LINK',
+        message: 'Customer account not properly linked to a client record.',
+      });
+    }
+
+    // Check customerId in query, params, or body
+    const requestedCustomerId = req.params.customerId || req.query.customerId || req.body.customerId;
+    if (requestedCustomerId && requestedCustomerId !== req.user.customerId) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'CUSTOMER_ISOLATION_VIOLATION',
+        message: 'Forbidden: You cannot access or modify records of another customer account.',
+      });
+    }
+  }
+
+  next();
+}
+
+/**
+ * Optional authentication middleware.
+ * If a valid token is present, populates req.user. If not, proceeds without error.
+ */
+export async function optionalAuth(req, res, next) {
+  let token = null;
+
+  if (req.cookies && req.cookies.token) {
+    token = req.cookies.token;
+  } else if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+    token = req.headers.authorization.split(' ')[1];
+  }
+
+  if (!token) {
+    return next();
+  }
+
+  const decoded = verifyToken(token);
+  if (!decoded || !decoded.userId) {
+    return next();
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      include: {
+        customer: {
+          select: {
+            id: true,
+            name: true,
+            contactPerson: true,
+            email: true,
+            vanId: true,
+            status: true,
+          },
+        },
+      },
+    });
+
+    if (user && user.isActive) {
+      const effectivePermissions = getEffectivePermissions(user);
+      req.user = {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        title: user.title,
+        permissions: user.permissions || null,
+        effectivePermissions,
+        customerId: user.customerId,
+        customer: user.customer,
+        lastLoginAt: user.lastLoginAt,
+      };
+    }
+  } catch (err) {
+    console.debug('optionalAuth non-critical error:', err.message);
+  }
+
+  next();
+}
+
+/**
+ * Guard customer portal API endpoints to ensure active Terms & Conditions acceptance.
+ * For users with role === 'customer', checks whether they have accepted the current published terms.
+ * If not accepted, returns 403 with code 'TERMS_ACCEPTANCE_REQUIRED'.
+ */
+export async function requireTermsAcceptance(req, res, next) {
+  // If no user or user is not a customer, terms enforcement is bypassed (admins/accountants exempt)
+  if (!req.user || req.user.role !== 'customer') {
+    return next();
+  }
+
+  try {
+    // Find active published terms requiring reacceptance
+    const activeTerms = await prisma.termsVersion.findFirst({
+      where: {
+        status: 'published',
+        requiresReacceptance: true,
+      },
+      orderBy: { publishedAt: 'desc' },
+      select: {
+        id: true,
+        version: true,
+        title: true,
+        publishedAt: true,
+      },
+    });
+
+    // If no published terms require acceptance, allow access
+    if (!activeTerms) {
+      return next();
+    }
+
+    // Check if user has accepted this terms version
+    const acceptance = await prisma.customerTermsAcceptance.findUnique({
+      where: {
+        userId_termsVersionId: {
+          userId: req.user.id,
+          termsVersionId: activeTerms.id,
+        },
+      },
+    });
+
+    if (!acceptance) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'TERMS_ACCEPTANCE_REQUIRED',
+        message: 'You must review and accept the latest Customer Terms & Conditions before continuing.',
+        termsVersion: activeTerms,
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error('requireTermsAcceptance middleware error:', error);
+    return res.status(500).json({
+      status: 'error',
+      code: 'INTERNAL_ERROR',
+      message: 'Failed to verify Terms & Conditions acceptance status.',
+    });
+  }
+}
+
+/**
+ * In-memory sliding-window rate limiter for sensitive authentication endpoints.
+ * Lightweight, zero-dependency, safe against memory leaks.
+ */
+export function createRateLimiter({ windowMs = 15 * 60 * 1000, max = 5, message = 'Too many requests. Please try again later.' }) {
+  const attempts = new Map();
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, record] of attempts.entries()) {
+      if (now - record.startTime > windowMs) {
+        attempts.delete(key);
+      }
+    }
+  }, 5 * 60 * 1000).unref();
+
+  return (req, res, next) => {
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown-client';
+    const clientKey = `${ip}:${req.baseUrl || ''}${req.path || ''}`;
+    const now = Date.now();
+
+    const record = attempts.get(clientKey);
+
+    if (!record || (now - record.startTime > windowMs)) {
+      attempts.set(clientKey, { count: 1, startTime: now });
+      return next();
+    }
+
+    record.count += 1;
+
+    if (record.count > max) {
+      const retryAfterSec = Math.ceil((record.startTime + windowMs - now) / 1000);
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        status: 'error',
+        code: 'RATE_LIMIT_EXCEEDED',
+        message,
+        retryAfter: retryAfterSec,
+      });
+    }
+
+    next();
+  };
+}
+
+export const loginLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: 'Too many login attempts from this address. Please wait a few minutes before trying again.',
+});
+
+export const forgotPasswordLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many password reset requests. Please wait a few minutes before requesting another link.',
+});
+
+export const resetPasswordLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many password reset submissions. Please wait a few minutes before trying again.',
+});
+
+
